@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Saves the bot token (hidden prompt) and (re)starts the bot.
+set -euo pipefail
+
+[ "$(id -u)" -eq 0 ] || { echo "Run as root: sudo awg-bot-set-token"; exit 1; }
+[ -t 0 ] || { echo "Run this in an interactive shell"; exit 1; }
+F=/etc/awg-bot/bot.env
+[ -f "$F" ] || { echo "$F not found - run install.sh first"; exit 1; }
+
+read -rsp "Bot token from @BotFather (input hidden): " TOKEN; echo
+case "$TOKEN" in
+  *[0-9]:*) ;;
+  *) echo "That does not look like a bot token (expected 123456:ABC...)"; exit 1 ;;
+esac
+
+ADMIN_IDS="$(sed -n 's/^ADMIN_IDS=//p' "$F")"
+umask 077
+printf 'BOT_TOKEN=%s\nADMIN_IDS=%s\n' "$TOKEN" "$ADMIN_IDS" > "$F"
+chown root:awgbot "$F"
+chmod 0640 "$F"
+unset TOKEN
+
+systemctl restart awg-bot
+sleep 2
+systemctl --no-pager --lines=5 status awg-bot || true
+echo "Done. Send /start to your bot in Telegram."
