@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""Manage AmneziaWG peers. Runs as root; the bot calls it through sudo.
+
+    awg-peerctl add NAME   -> prints the client .conf to stdout
+    awg-peerctl del NAME
+    awg-peerctl list       -> JSON
+"""
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+CONF = os.environ.get("AWG_CONF", "/etc/amnezia/amneziawg/awg0.conf")
+IFACE = os.environ.get("AWG_IFACE", "awg0")
+SETTINGS = os.environ.get("AWG_SETTINGS", "/etc/awg-bot/settings.env")
+LOCK = "/run/awg-peerctl.lock"
+
+NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+OBF_KEYS = ("Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4",
+            "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5")
+
+
+class Error(Exception):
+    pass
+
+
+def run(*args, stdin=None):
+    r = subprocess.run(args, input=stdin, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Error(f"{args[0]} {args[1] if len(args) > 1 else ''} failed: {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def load_settings():
+    cfg = {}
+    try:
+        with open(SETTINGS) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip().strip('"')
+    except FileNotFoundError:
+        raise Error(f"{SETTINGS} not found")
+    if not cfg.get("ENDPOINT"):
+        raise Error("ENDPOINT is not set in settings")
+    return cfg
+
+
+def parse(text):
+    """Split the config into blocks; each starts at a line beginning with '['."""
+    blocks = []
+    for line in text.splitlines():
+        if line.startswith("["):
+            blocks.append([line])
+        elif blocks:
+            blocks[-1].append(line)
+    return [[ln for ln in b] for b in blocks]
+
+
+def fields(block):
+    out = {}
+    for ln in block[1:]:
+        s = ln.strip()
+        if s.startswith("# name:"):
+            out["name"] = s.split(":", 1)[1].strip()
+        elif "=" in s and not s.startswith("#"):
+            k, v = s.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def render(blocks):
+    parts = []
+    for b in blocks:
+        lines = list(b)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts) + "\n"
+
+
+def peers_of(blocks):
+    res = []
+    for b in blocks:
+        if b[0].strip().lower() == "[peer]":
+            f = fields(b)
+            ip = f.get("AllowedIPs", "").split("/")[0].split(",")[0].strip()
+            name = f.get("name") or ("peer-" + ip.split(".")[-1] if ip else "peer")
+            res.append({"name": name, "ip": ip, "pub": f.get("PublicKey", ""), "block": b})
+    return res
+
+
+def write_conf(text):
+    st = os.stat(CONF)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CONF))
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp, st.st_mode & 0o777)
+        os.replace(tmp, CONF)
+    except Exception:
+        os.unlink(tmp)
+        raise
+
+
+def free_ip(blocks):
+    iface = fields(next(b for b in blocks if b[0].strip().lower() == "[interface]"))
+    net = ipaddress.ip_interface(iface["Address"].split(",")[0].strip())
+    used = {ipaddress.ip_address(p["ip"]) for p in peers_of(blocks) if p["ip"]}
+    used.add(net.ip)
+    for host in net.network.hosts():
+        if host not in used:
+            return str(host)
+    raise Error("no free addresses left in the subnet")
+
+
+def cmd_add(name):
+    if not NAME_RE.match(name):
+        raise Error("name must be 1-32 chars: letters, digits, _ or -")
+    cfg = load_settings()
+    blocks = parse(open(CONF).read())
+    peers = peers_of(blocks)
+    if any(p["name"] == name for p in peers):
+        raise Error(f"profile '{name}' already exists")
+
+    iface = fields(next(b for b in blocks if b[0].strip().lower() == "[interface]"))
+    ip = free_ip(blocks)
+    priv = run("awg", "genkey")
+    pub = run("awg", "pubkey", stdin=priv)
+    psk = run("awg", "genpsk")
+    server_pub = run("awg", "show", IFACE, "public-key")
+
+    fd, pskfile = tempfile.mkstemp()
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(psk + "\n")
+        run("awg", "set", IFACE, "peer", pub, "preshared-key", pskfile, "allowed-ips", f"{ip}/32")
+    finally:
+        os.unlink(pskfile)
+
+    blocks.append(["[Peer]", f"# name: {name}", f"PublicKey = {pub}",
+                   f"PresharedKey = {psk}", f"AllowedIPs = {ip}/32"])
+    try:
+        write_conf(render(blocks))
+    except Exception:
+        run("awg", "set", IFACE, "peer", pub, "remove")
+        raise
+
+    obf = [f"{k} = {iface[k]}" for k in OBF_KEYS if k in iface]
+    conf = "\n".join([
+        "[Interface]",
+        f"PrivateKey = {priv}",
+        f"Address = {ip}/32",
+        f"DNS = {cfg.get('DNS', '1.1.1.1, 8.8.8.8')}",
+        f"MTU = {cfg.get('MTU', '1280')}",
+        *obf,
+        "",
+        "[Peer]",
+        f"PublicKey = {server_pub}",
+        f"PresharedKey = {psk}",
+        f"AllowedIPs = {cfg.get('ALLOWED_IPS', '0.0.0.0/0, ::/0')}",
+        f"Endpoint = {cfg['ENDPOINT']}",
+        "PersistentKeepalive = 25",
+        "",
+    ])
+    sys.stdout.write(conf)
+
+
+def cmd_del(name):
+    if not NAME_RE.match(name):
+        raise Error("invalid name")
+    blocks = parse(open(CONF).read())
+    target = next((p for p in peers_of(blocks) if p["name"] == name), None)
+    if not target:
+        raise Error(f"profile '{name}' not found")
+    try:
+        run("awg", "set", IFACE, "peer", target["pub"], "remove")
+    except Error:
+        pass  # already gone from the live interface; still drop it from the config
+    blocks = [b for b in blocks if b is not target["block"]]
+    write_conf(render(blocks))
+    print("deleted")
+
+
+def cmd_list():
+    blocks = parse(open(CONF).read())
+    hs, tr = {}, {}
+    try:
+        for ln in run("awg", "show", IFACE, "latest-handshakes").splitlines():
+            k, v = ln.split()
+            hs[k] = int(v)
+        for ln in run("awg", "show", IFACE, "transfer").splitlines():
+            k, rx, tx = ln.split()
+            tr[k] = (int(rx), int(tx))
+    except Error:
+        pass
+    now = int(time.time())
+    out = []
+    for p in peers_of(blocks):
+        h = hs.get(p["pub"], 0)
+        rx, tx = tr.get(p["pub"], (0, 0))
+        out.append({"name": p["name"], "ip": p["ip"],
+                    "last_seen_sec": (now - h) if h else None, "rx": rx, "tx": tx})
+    print(json.dumps(out))
+
+
+def main():
+    if len(sys.argv) < 2:
+        raise Error("usage: awg-peerctl add NAME | del NAME | list")
+    cmd = sys.argv[1]
+    with open(LOCK, "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        if cmd == "add" and len(sys.argv) == 3:
+            cmd_add(sys.argv[2])
+        elif cmd == "del" and len(sys.argv) == 3:
+            cmd_del(sys.argv[2])
+        elif cmd == "list" and len(sys.argv) == 2:
+            cmd_list()
+        else:
+            raise Error("usage: awg-peerctl add NAME | del NAME | list")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Error as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram bot for managing AmneziaWG profiles
+After=network-online.target awg-quick@awg0.service
+Wants=network-online.target
+
+[Service]
+User=awgbot
+Group=awgbot
+EnvironmentFile=/etc/awg-bot/bot.env
+ExecStart=/opt/awg-bot/venv/bin/python /opt/awg-bot/bot.py
+Restart=always
+RestartSec=5
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
