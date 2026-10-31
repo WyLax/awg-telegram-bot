@@ -75,13 +75,24 @@ def ago(sec) -> str:
     return f"{sec // 86400} дн назад"
 
 
+DESC_MAX = 200
+
 HELP = (
     "Управление профилями VPN.\n\n"
-    "/new <имя> — создать профиль (файл и QR-код)\n"
+    "/new <имя> [описание] — создать профиль (файл и QR-код)\n"
+    "/desc <имя> [описание] — задать или изменить описание (без текста — очистить)\n"
     "/delete <имя> — удалить профиль\n"
     "/list — список профилей\n\n"
-    "Имя: латиница, цифры, _ и -, до 32 символов."
+    f"Имя: латиница, цифры, _ и -, до 32 символов. Описание: любой текст до {DESC_MAX} символов, "
+    "например «телефон Васи»."
 )
+
+
+def split_args(args: str | None) -> tuple[str, str]:
+    """'phone Vasya's phone' -> ('phone', "Vasya's phone")."""
+    parts = (args or "").strip().split(maxsplit=1)
+    return (parts[0] if parts else ""), (parts[1].strip() if len(parts) > 1 else "")
+
 
 dp = Dispatcher()
 
@@ -93,21 +104,25 @@ async def on_help(m: Message):
 
 @dp.message(Command("new"))
 async def on_new(m: Message, command: CommandObject):
-    name = (command.args or "").strip()
+    name, desc = split_args(command.args)
     if not NAME_RE.match(name):
-        await m.answer("Укажите имя: /new phone\nДопустимы латиница, цифры, _ и -.")
+        await m.answer("Укажите имя: /new phone телефон Васи\nИмя: латиница, цифры, _ и -; описание необязательно.")
+        return
+    if len(desc) > DESC_MAX:
+        await m.answer(f"Описание слишком длинное: {len(desc)} из {DESC_MAX} символов.")
         return
     try:
-        conf = await peerctl("add", name)
+        conf = await peerctl("add", name, *([desc] if desc else []))
     except PeerctlError as e:
         await m.answer(f"Не получилось: {e}")
         return
 
+    shown = f"\n{desc}" if desc else ""
     await m.answer_document(
         BufferedInputFile(conf.encode(), filename=f"{name}.conf"),
         caption=(
-            f"Профиль «{name}» создан. В файле приватный ключ: "
-            "не пересылайте его и удалите это сообщение после импорта."
+            f"Профиль «{name}» создан.{shown}\n"
+            "В файле приватный ключ: не пересылайте его и удалите это сообщение после импорта."
         ),
     )
     try:
@@ -133,12 +148,40 @@ async def on_list(m: Message):
     if not peers:
         await m.answer("Профилей нет.")
         return
-    lines = [
-        f"• {p['name']} ({p['ip']}) — {ago(p['last_seen_sec'])}, "
-        f"↓{human(p['tx'])} ↑{human(p['rx'])}"
-        for p in peers
-    ]
-    await m.answer(f"Профилей: {len(peers)}\n" + "\n".join(lines))
+    lines = []
+    for p in peers:
+        line = (f"• {p['name']} ({p['ip']}) — {ago(p['last_seen_sec'])}, "
+                f"↓{human(p['tx'])} ↑{human(p['rx'])}")
+        if p.get("desc"):
+            line += f"\n   {p['desc']}"
+        lines.append(line)
+
+    # Telegram messages are limited to 4096 characters.
+    chunk, size = [f"Профилей: {len(peers)}"], 0
+    for line in lines:
+        if size + len(line) > 3500:
+            await m.answer("\n".join(chunk))
+            chunk, size = [], 0
+        chunk.append(line)
+        size += len(line) + 1
+    await m.answer("\n".join(chunk))
+
+
+@dp.message(Command("desc"))
+async def on_desc(m: Message, command: CommandObject):
+    name, desc = split_args(command.args)
+    if not NAME_RE.match(name):
+        await m.answer("Укажите имя и описание: /desc phone телефон Васи\nБез описания — оно очистится.")
+        return
+    if len(desc) > DESC_MAX:
+        await m.answer(f"Описание слишком длинное: {len(desc)} из {DESC_MAX} символов.")
+        return
+    try:
+        await peerctl("desc", name, *([desc] if desc else []))
+    except PeerctlError as e:
+        await m.answer(f"Не получилось: {e}")
+        return
+    await m.answer(f"Описание профиля «{name}» {'обновлено' if desc else 'очищено'}.")
 
 
 @dp.message(Command("delete"))

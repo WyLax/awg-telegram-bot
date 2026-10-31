@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Manage AmneziaWG peers. Runs as root; the bot calls it through sudo.
 
-    awg-peerctl add NAME   -> prints the client .conf to stdout
+    awg-peerctl add NAME [DESCRIPTION]  -> prints the client .conf to stdout
+    awg-peerctl desc NAME [DESCRIPTION] -> sets the description (empty clears it)
     awg-peerctl del NAME
-    awg-peerctl list       -> JSON
+    awg-peerctl list                    -> JSON
 """
 import fcntl
 import ipaddress
@@ -21,6 +22,7 @@ SETTINGS = os.environ.get("AWG_SETTINGS", "/etc/awg-bot/settings.env")
 LOCK = "/run/awg-peerctl.lock"
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+DESC_MAX = 200
 OBF_KEYS = ("Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4",
             "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5")
 
@@ -36,10 +38,24 @@ def run(*args, stdin=None):
     return r.stdout.strip()
 
 
+def clean_desc(text):
+    """One line, no control characters (the text ends up inside the config file)."""
+    text = re.sub("[\x00-\x1f\x7f\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}]+", " ", text or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > DESC_MAX:
+        raise Error(f"description is too long (max {DESC_MAX} characters)")
+    return text
+
+
+def read_conf():
+    with open(CONF, encoding="utf-8") as f:
+        return f.read()
+
+
 def load_settings():
     cfg = {}
     try:
-        with open(SETTINGS) as f:
+        with open(SETTINGS, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
@@ -69,6 +85,8 @@ def fields(block):
         s = ln.strip()
         if s.startswith("# name:"):
             out["name"] = s.split(":", 1)[1].strip()
+        elif s.startswith("# desc:"):
+            out["desc"] = s.split(":", 1)[1].strip()
         elif "=" in s and not s.startswith("#"):
             k, v = s.split("=", 1)
             out[k.strip()] = v.strip()
@@ -92,7 +110,8 @@ def peers_of(blocks):
             f = fields(b)
             ip = f.get("AllowedIPs", "").split("/")[0].split(",")[0].strip()
             name = f.get("name") or ("peer-" + ip.split(".")[-1] if ip else "peer")
-            res.append({"name": name, "ip": ip, "pub": f.get("PublicKey", ""), "block": b})
+            res.append({"name": name, "ip": ip, "pub": f.get("PublicKey", ""),
+                        "desc": f.get("desc", ""), "block": b})
     return res
 
 
@@ -100,7 +119,7 @@ def write_conf(text):
     st = os.stat(CONF)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CONF))
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
         os.chmod(tmp, st.st_mode & 0o777)
         os.replace(tmp, CONF)
@@ -120,11 +139,12 @@ def free_ip(blocks):
     raise Error("no free addresses left in the subnet")
 
 
-def cmd_add(name):
+def cmd_add(name, desc=""):
     if not NAME_RE.match(name):
         raise Error("name must be 1-32 chars: letters, digits, _ or -")
+    desc = clean_desc(desc)
     cfg = load_settings()
-    blocks = parse(open(CONF).read())
+    blocks = parse(read_conf())
     peers = peers_of(blocks)
     if any(p["name"] == name for p in peers):
         raise Error(f"profile '{name}' already exists")
@@ -144,8 +164,11 @@ def cmd_add(name):
     finally:
         os.unlink(pskfile)
 
-    blocks.append(["[Peer]", f"# name: {name}", f"PublicKey = {pub}",
-                   f"PresharedKey = {psk}", f"AllowedIPs = {ip}/32"])
+    head = ["[Peer]", f"# name: {name}"]
+    if desc:
+        head.append(f"# desc: {desc}")
+    blocks.append(head + [f"PublicKey = {pub}", f"PresharedKey = {psk}",
+                          f"AllowedIPs = {ip}/32"])
     try:
         write_conf(render(blocks))
     except Exception:
@@ -172,10 +195,27 @@ def cmd_add(name):
     sys.stdout.write(conf)
 
 
+def cmd_desc(name, desc=""):
+    if not NAME_RE.match(name):
+        raise Error("invalid name")
+    desc = clean_desc(desc)
+    blocks = parse(read_conf())
+    target = next((p for p in peers_of(blocks) if p["name"] == name), None)
+    if not target:
+        raise Error(f"profile '{name}' not found")
+    block = target["block"]
+    block[:] = [ln for ln in block if not ln.strip().startswith("# desc:")]
+    if desc:
+        at = 2 if len(block) > 1 and block[1].strip().startswith("# name:") else 1
+        block.insert(at, f"# desc: {desc}")
+    write_conf(render(blocks))
+    print("updated" if desc else "cleared")
+
+
 def cmd_del(name):
     if not NAME_RE.match(name):
         raise Error("invalid name")
-    blocks = parse(open(CONF).read())
+    blocks = parse(read_conf())
     target = next((p for p in peers_of(blocks) if p["name"] == name), None)
     if not target:
         raise Error(f"profile '{name}' not found")
@@ -189,7 +229,7 @@ def cmd_del(name):
 
 
 def cmd_list():
-    blocks = parse(open(CONF).read())
+    blocks = parse(read_conf())
     hs, tr = {}, {}
     try:
         for ln in run("awg", "show", IFACE, "latest-handshakes").splitlines():
@@ -205,25 +245,28 @@ def cmd_list():
     for p in peers_of(blocks):
         h = hs.get(p["pub"], 0)
         rx, tx = tr.get(p["pub"], (0, 0))
-        out.append({"name": p["name"], "ip": p["ip"],
+        out.append({"name": p["name"], "ip": p["ip"], "desc": p["desc"],
                     "last_seen_sec": (now - h) if h else None, "rx": rx, "tx": tx})
     print(json.dumps(out))
 
 
 def main():
+    usage = "usage: awg-peerctl add NAME [DESC] | desc NAME [DESC] | del NAME | list"
     if len(sys.argv) < 2:
-        raise Error("usage: awg-peerctl add NAME | del NAME | list")
-    cmd = sys.argv[1]
+        raise Error(usage)
+    cmd, args = sys.argv[1], sys.argv[2:]
     with open(LOCK, "w") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
-        if cmd == "add" and len(sys.argv) == 3:
-            cmd_add(sys.argv[2])
-        elif cmd == "del" and len(sys.argv) == 3:
-            cmd_del(sys.argv[2])
-        elif cmd == "list" and len(sys.argv) == 2:
+        if cmd == "add" and len(args) in (1, 2):
+            cmd_add(*args)
+        elif cmd == "desc" and len(args) in (1, 2):
+            cmd_desc(*args)
+        elif cmd == "del" and len(args) == 1:
+            cmd_del(*args)
+        elif cmd == "list" and not args:
             cmd_list()
         else:
-            raise Error("usage: awg-peerctl add NAME | del NAME | list")
+            raise Error(usage)
 
 
 if __name__ == "__main__":
