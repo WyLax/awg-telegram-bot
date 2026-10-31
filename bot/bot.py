@@ -1,11 +1,9 @@
 import asyncio
-import io
 import json
 import logging
 import os
 import re
 
-import qrcode
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
@@ -77,11 +75,21 @@ def ago(sec) -> str:
 
 HELP = (
     "Управление профилями VPN.\n\n"
-    "/new <имя> — создать профиль (файл и QR-код)\n"
+    "/new <имя> — создать профиль и прислать для него .conf файл\n"
     "/delete <имя> — удалить профиль\n"
     "/list — список профилей\n\n"
     "Имя: латиница, цифры, _ и -, до 32 символов."
 )
+
+
+def conf_summary(conf: str) -> dict:
+    """Pull the VPN address and server endpoint out of a generated client config."""
+    values = {}
+    for line in conf.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            values.setdefault(k.strip(), v.strip())
+    return {"address": values.get("Address", "?"), "endpoint": values.get("Endpoint", "?")}
 
 dp = Dispatcher()
 
@@ -103,24 +111,18 @@ async def on_new(m: Message, command: CommandObject):
         await m.answer(f"Не получилось: {e}")
         return
 
+    info = conf_summary(conf)
     await m.answer_document(
         BufferedInputFile(conf.encode(), filename=f"{name}.conf"),
         caption=(
-            f"Профиль «{name}» создан. В файле приватный ключ: "
-            "не пересылайте его и удалите это сообщение после импорта."
+            f"Профиль «{name}» создан.\n"
+            f"Адрес в VPN: {info['address']}\n"
+            f"Сервер: {info['endpoint']}\n\n"
+            "Как подключить: приложение AmneziaWG → «+» → «Добавить туннель» → «Из файла» "
+            "и выберите этот файл.\n\n"
+            "В файле приватный ключ: не пересылайте его и удалите сообщение после импорта."
         ),
     )
-    try:
-        img = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=6, border=2)
-        img.add_data(conf)
-        img.make(fit=True)
-        buf = io.BytesIO()
-        img.make_image().save(buf, format="PNG")
-        await m.answer_photo(BufferedInputFile(buf.getvalue(), filename=f"{name}.png"),
-                             caption="QR-код для телефона")
-    except Exception:
-        log.exception("QR generation failed")
-        await m.answer("QR-код создать не удалось, используйте файл.")
 
 
 @dp.message(Command("list"))
